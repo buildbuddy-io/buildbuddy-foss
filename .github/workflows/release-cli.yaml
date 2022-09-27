@@ -1,0 +1,98 @@
+name: "release-cli"
+
+on:
+  push:
+    tags:
+      - "cli-v*"
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    if: "!contains(github.event.head_commit.message, 'release skip')"
+    outputs:
+      version: ${{ steps.version.outputs.VERSION }}
+    permissions:
+      contents: write
+    steps:
+      - name: Get CLI version from tag
+        id: version
+        # Strip "cli-v" prefix from the tag to get the CLI version.
+        # e.g. cli-v1.2.3 sets VERSION to 1.2.3
+        run: echo ::set-output name=VERSION::${GITHUB_REF/refs\/tags\/cli-v/}
+
+      - name: Checkout buildbuddy-io/bazel
+        uses: actions/checkout@v3
+        with:
+          repository: buildbuddy-io/bazel
+          path: bazel-fork
+
+      - name: Create draft release if necessary
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view ${{ steps.version.outputs.VERSION }} --repo=buildbuddy-io/bazel; then
+            echo "buildbuddy-io/bazel release ${{ steps.version.outputs.VERSION }} already exists."
+
+            # It's OK if the release already exists; the build-artifacts job will just overwrite
+            # any existing artifacts.
+            exit 0
+          fi
+
+          TAG=${{ steps.version.outputs.VERSION }}
+
+          cd "${GITHUB_WORKSPACE}/bazel-fork"
+          git fetch --tags
+          if [[ "$(git tag -l "$TAG")" ]]; then
+            echo "Tag $TAG already exists."
+          else
+            echo "Creating tag $TAG"
+            git tag "$TAG"
+            git push origin "$TAG"
+          fi
+          gh release create "$TAG" \
+            --repo=buildbuddy-io/bazel --title="$TAG" --draft --notes="Release version $TAG"
+
+  build-artifacts:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, m1]
+    runs-on: ${{ matrix.os }}
+    needs: create-release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          path: buildbuddy
+
+      - name: Install bazelisk
+        run: |
+          if [[ "$OSTYPE" == darwin* ]]; then
+            OS=darwin
+          else
+            OS=linux
+          fi
+          ARCH=$(uname -m)
+
+          curl -L "https://github.com/bazelbuild/bazelisk/releases/download/v1.10.1/bazelisk-darwin-arm64" --output bazelisk
+          mkdir -p "${GITHUB_WORKSPACE}/bin/"
+          mv bazelisk "${GITHUB_WORKSPACE}/bin/bazel"
+          chmod +x "${GITHUB_WORKSPACE}/bin/bazel"
+
+      - name: Upload Artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [[ "$OSTYPE" == darwin* ]]; then
+            OS=darwin
+          else
+            OS=linux
+          fi
+          ARCH=$(uname -m)
+
+          export DEVELOPER_DIR=/Applications/Xcode_12.4.app/Contents/Developer
+          cd "${GITHUB_WORKSPACE}/buildbuddy"
+          "${GITHUB_WORKSPACE}/bin/bazel" build //cli/cmd/bb \
+              --remote_header=x-buildbuddy-api-key=${{ secrets.BUILDBUDDY_ORG_API_KEY }} \
+              --define version=${{ steps.tag.outputs.TAG }}
+          cp bazel-bin/cli/cmd/bb/bb_/bb bazel-${{ steps.version.outputs.VERSION }}-${OS}-${ARCH}
+          gh release upload --repo buildbuddy-io/bazel ${{ needs.create-release.outputs.VERSION }} bazel-${{ steps.version.outputs.VERSION }}-${OS}-${ARCH} --clobber
