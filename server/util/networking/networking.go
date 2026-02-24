@@ -43,6 +43,7 @@ var (
 	taskAllowedPrivateIPs         = flag.Slice("executor.task_allowed_private_ips", []string{}, "Allowed private IPs that should be reachable from actions: either 'default', an IP address, or IP range. Private IP ranges as defined in RFC1918 are otherwise blocked.")
 	networkStatsEnabled           = flag.Bool("executor.network_stats_enabled", false, "Enable basic tx/rx statistics.")
 	clampMSSToPMTU                = flag.Bool("executor.clamp-mss-to-pmtu", false, "Clamp the TCP MSS to the PMTU for outgoing connections.")
+	cleanupStaleVethDevices       = flag.Bool("executor.cleanup_stale_veth_devices", false, "If true, clean up stale veth devices with conflicting IPs before creating new ones.", flag.Internal)
 
 	// Private IP ranges, as defined in RFC1918.
 	PrivateIPRanges = []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16"}
@@ -251,8 +252,45 @@ func randomVethName(prefix string) (string, error) {
 	return prefix + suffix, nil
 }
 
-// createRandomVethPair attempts to create a veth pair with random names, the veth1 end of which will
-// be in the root namespace.
+// cleanupStaleVeths removes any existing veth devices that have the given IP
+// address assigned. This handles the case where a previous process was killed
+// without cleanup (e.g. SIGKILL), leaving orphaned veth devices with stale
+// routes that would cause routing conflicts with newly created veth pairs.
+func cleanupStaleVeths(ctx context.Context, ipWithCIDR string) error {
+	links, err := netlink.LinkList()
+	if err != nil {
+		return status.WrapError(err, "list links")
+	}
+	targetIP, _, err := net.ParseCIDR(ipWithCIDR)
+	if err != nil {
+		return status.WrapError(err, "parse target IP")
+	}
+	for _, link := range links {
+		// Only consider veth devices to avoid accidentally deleting
+		// non-veth interfaces that happen to share the same IP.
+		if link.Type() != "veth" {
+			continue
+		}
+		addrs, err := netlink.AddrList(link, 0 /* FAMILY_ALL */)
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			if addr.IP.Equal(targetIP) {
+				staleDev := link.Attrs().Name
+				log.CtxWarningf(ctx, "Cleaning up stale veth device %q with IP %s (likely from a killed process)", staleDev, targetIP)
+				if err := runCommand(ctx, "ip", "link", "delete", staleDev); err != nil {
+					log.CtxWarningf(ctx, "Failed to delete stale veth device %q: %s", staleDev, err)
+				}
+				break // inner loop: each link has one matching addr at most
+			}
+		}
+	}
+	return nil
+}
+
+// createRandomVethPair attempts to create a veth pair with random names, the
+// veth1 end of which will be in the root namespace.
 func createRandomVethPair(ctx context.Context, netns *Namespace) (string, string, error) {
 	var namespacedVeth, hostVeth string
 	var err error
@@ -377,6 +415,14 @@ func (p *VethNetworkPool[T]) Get(ctx context.Context) T {
 		return zero
 	}
 	n.getVethPair().network = network
+
+	// Clean up stale veths before assigning the new IP, to avoid routing
+	// conflicts with orphaned devices from killed processes.
+	if *cleanupStaleVethDevices {
+		if err := cleanupStaleVeths(ctx, network.HostIPWithCIDR()); err != nil {
+			log.CtxWarningf(ctx, "Error during stale veth cleanup for %s: %s", network.HostIPWithCIDR(), err)
+		}
+	}
 
 	// Assign IPs to the host and namespaced side, and create the default route
 	// in the namespace.
@@ -698,6 +744,17 @@ func setupVethPair(ctx context.Context, netns *Namespace, enableExternalNetworki
 		}
 		return nil
 	})
+
+	// Clean up any stale veth devices from previous processes that were
+	// killed without cleanup (e.g. SIGKILL). The flock on the IP range is
+	// released when the process dies, but the kernel-level veth pairs and
+	// routes persist. If we don't clean these up, return traffic will be
+	// routed to a stale veth instead of ours, breaking connectivity.
+	if *cleanupStaleVethDevices {
+		if err := cleanupStaleVeths(ctx, vp.network.HostIPWithCIDR()); err != nil {
+			log.CtxWarningf(ctx, "Error during stale veth cleanup for %s: %s", vp.network.HostIPWithCIDR(), err)
+		}
+	}
 
 	// Create a veth pair with randomly generated names.
 	vp.namespacedDevice, vp.hostDevice, err = createRandomVethPair(ctx, netns)

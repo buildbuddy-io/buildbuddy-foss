@@ -168,11 +168,15 @@ type envOpts struct {
 }
 
 func getTestEnv(ctx context.Context, t *testing.T, opts envOpts) *testenv.TestEnv {
+	// Clean up stale veth devices from previous test runs that were killed
+	// without cleanup (e.g. SIGKILL from the test runner).
+	flags.Set(t, "executor.cleanup_stale_veth_devices", true)
 	err := networking.Configure(ctx)
 	require.NoError(t, err)
 	testnetworking.Setup(t)
 	err = networking.EnableMasquerading(ctx)
 	require.NoError(t, err)
+
 	// Set up a lockfile directory to coordinate network locking across sharded
 	// test processes on the host.
 	flags.Set(t, "executor.network_lock_directory", "/tmp/buildbuddy/networking/locks")
