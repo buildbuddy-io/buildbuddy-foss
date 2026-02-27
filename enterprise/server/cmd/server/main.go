@@ -66,6 +66,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/janitor"
 	"github.com/buildbuddy-io/buildbuddy/server/libmain"
 	"github.com/buildbuddy-io/buildbuddy/server/real_environment"
+	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/capabilities_server"
 	"github.com/buildbuddy-io/buildbuddy/server/telemetry"
 	"github.com/buildbuddy-io/buildbuddy/server/util/clickhouse"
 	"github.com/buildbuddy-io/buildbuddy/server/util/healthcheck"
@@ -253,7 +254,13 @@ func main() {
 		log.Fatal(err.Error())
 	}
 
+	libmain.RegisterLocalServersAndClients(realEnv)
+
 	if err := execution_server.Register(realEnv); err != nil {
+		log.Fatalf("%v", err)
+	}
+	// Needs to be registered after the execution server.
+	if err := capabilities_server.Register(realEnv); err != nil {
 		log.Fatalf("%v", err)
 	}
 	if err := scheduler_server.Register(realEnv); err != nil {
@@ -326,8 +333,6 @@ func main() {
 	if err := selfauth.Register(realEnv); err != nil {
 		log.Fatalf("%v", err)
 	}
-
-	libmain.RegisterLocalServersAndClients(realEnv)
 
 	if err := ocifetcher.RegisterServer(realEnv); err != nil {
 		log.Fatalf("%v", err)
