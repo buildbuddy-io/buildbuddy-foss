@@ -141,6 +141,8 @@ require (
 	github.com/prometheus/common v0.67.2
 	github.com/rantav/go-grpc-channelz v0.0.3
 	github.com/rs/zerolog v1.29.1
+	github.com/sendgrid/rest v2.6.9+incompatible
+	github.com/sendgrid/sendgrid-go v3.16.1+incompatible
 	github.com/shirou/gopsutil/v3 v3.23.12
 	github.com/shurcooL/githubv4 v0.0.0-20231126234147-1cffa1f02456
 	github.com/sirupsen/logrus v1.9.4
