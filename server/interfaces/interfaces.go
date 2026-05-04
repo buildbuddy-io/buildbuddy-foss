@@ -680,6 +680,8 @@ type WorkflowService interface {
 	// InvalidateAllSnapshotsForRepo invalidates all snapshots for a repo. Any future workflow
 	// runs will be executed on a clean runner.
 	InvalidateAllSnapshotsForRepo(ctx context.Context, repoURL string) error
+
+	RunScheduledWorkflows(ctx context.Context) error
 }
 
 type WorkspaceService interface {
@@ -716,11 +718,14 @@ type GitHubApp interface {
 
 	CreateRepo(context.Context, *rppb.CreateRepoRequest) (*rppb.CreateRepoResponse, error)
 
-	// GetInstallationTokenForStatusReportingOnly returns an installation token
+	// GetInstallationTokenForInternalUseOnly returns an installation token
 	// for the installation associated with the given installation owner (GitHub
 	// username or org name). It does not authorize the authenticated group ID,
-	// so should be used for status reporting only.
-	GetInstallationTokenForStatusReportingOnly(ctx context.Context, owner string) (*github.InstallationToken, error)
+	// so should be used for internal use only.
+	GetInstallationTokenForInternalUseOnly(ctx context.Context, owner string) (*github.InstallationToken, error)
+
+	// GetDefaultBranch returns the default branch for the given repo URL.
+	GetDefaultBranch(ctx context.Context, repoURL string, accessToken string) (string, error)
 
 	// GetRepositoryInstallationToken returns an installation token for the given repo.
 	// The repo must've been imported to BuildBuddy (i.e. a GitRepository row was created).
