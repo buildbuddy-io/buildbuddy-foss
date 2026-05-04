@@ -253,7 +253,7 @@ type remoteIPRulesProvider struct {
 }
 
 func newRemoteIPRulesProvider(env environment.Env, target string) (*remoteIPRulesProvider, error) {
-	conn, err := grpc_client.DialInternal(env, target)
+	conn, err := grpc_client.DialInternalWithoutPooling(env, target)
 	if err != nil {
 		return nil, status.UnavailableErrorf("failed to dial remote IP rules backend %q: %v", target, err)
 	}

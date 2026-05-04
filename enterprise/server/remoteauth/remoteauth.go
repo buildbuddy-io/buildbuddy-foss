@@ -51,7 +51,7 @@ var (
 )
 
 func Register(env *real_environment.RealEnv) error {
-	conn, err := grpc_client.DialInternal(env, *target)
+	conn, err := grpc_client.DialInternalWithoutPooling(env, *target)
 	if err != nil {
 		return err
 	}
