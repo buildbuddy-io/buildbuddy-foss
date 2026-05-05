@@ -122,6 +122,14 @@ const (
 	// Given that dispatching a workflow is expected to be quick, this should be more than enough time,
 	// unless the original server goes down (e.g. if it was restarted in a rollout).
 	scheduledWorkflowLeaseDuration = 5 * time.Minute
+
+	// If a scheduled workflow fails, it will be retried up to this many times.
+	// If all retries fail, the current schedule is skipped until the next time the cron fires.
+	ScheduledWorkflowMaxRetries = 5
+
+	// Max number of times a scheduled workflow can exhaust all its retries.
+	// Afterwards, the scheduled workflow will be paused and requires manual re-enabling.
+	ScheduledWorkflowMaxConsecutiveFailures = 20
 )
 
 var (
@@ -1868,7 +1876,6 @@ func (ws *workflowService) RunScheduledWorkflows(ctx context.Context) error {
 		return status.InternalError("database or GitHub app service not available")
 	}
 
-	// TODO(Maggie): Add a max number of retries per task, to avoid hot looping on tasks that can't be scheduled.
 	for {
 		scheduled, err := ws.claimScheduledWorkflow(ctx)
 		if err != nil {
@@ -1880,9 +1887,8 @@ func (ws *workflowService) RunScheduledWorkflows(ctx context.Context) error {
 			break
 		}
 		if err := ws.dispatchScheduledWorkflow(ctx, scheduled); err != nil {
-			log.CtxErrorf(ctx, "Failed to dispatch scheduled workflow %s: %s", scheduled.ScheduleID, err)
-			if err := ws.unclaimScheduledWorkflow(ctx, scheduled.ScheduleID); err != nil {
-				log.CtxWarningf(ctx, "Failed to unclaim scheduled workflow %s: %s", scheduled.ScheduleID, err)
+			if err := ws.handleScheduledWorkflowFailure(ctx, scheduled, err); err != nil {
+				log.CtxWarningf(ctx, "Failed to handle scheduled workflow failure %s: %s", scheduled.ScheduleID, err)
 			}
 			continue
 		}
@@ -1901,8 +1907,9 @@ func (ws *workflowService) claimScheduledWorkflow(ctx context.Context) (*tables.
 			FROM "ScheduledRuns"
 			WHERE next_run_usec <= ?
 			  AND (lease_expires_usec = 0 OR lease_expires_usec <= ?)
+			  AND consecutive_schedule_failure_count < ?
 			ORDER BY next_run_usec ASC
-			LIMIT 1 `+dbh.SelectForUpdateModifier(), nowUsec, nowUsec).Take(scheduled)
+			LIMIT 1 `+dbh.SelectForUpdateModifier(), nowUsec, nowUsec, ScheduledWorkflowMaxConsecutiveFailures).Take(scheduled)
 		if err != nil {
 			if db.IsRecordNotFound(err) {
 				scheduled = nil
@@ -1935,21 +1942,56 @@ func (ws *workflowService) claimScheduledWorkflow(ctx context.Context) (*tables.
 	return scheduled, nil
 }
 
-func (ws *workflowService) unclaimScheduledWorkflow(ctx context.Context, scheduleID string) error {
-	// TODO(Maggie): Consider updating next_run_usec to some time in the future, in case there is a
-	// transient scheduling issue.
-	now := ws.env.GetClock().Now().UnixMicro()
-	result := ws.env.GetDBHandle().NewQuery(ctx, "workflow_service_unclaim_schedule_run").Raw(`
+// handleScheduledWorkflowFailure applies exponential backoff retry logic when a dispatch fails.
+func (ws *workflowService) handleScheduledWorkflowFailure(ctx context.Context, scheduled *tables.ScheduledRun, dispatchErr error) error {
+	currentAttempt := scheduled.FailedAttemptCount
+	if currentAttempt+1 < ScheduledWorkflowMaxRetries {
+		// Multiply the backoff by 2 for each retry, starting at 30 seconds.
+		backoff := 30 * time.Second << uint(currentAttempt)
+		nextRunUsec := ws.env.GetClock().Now().Add(backoff).UnixMicro()
+		log.CtxWarningf(ctx, "Scheduled workflow %s failed attempt %v: %s", scheduled.ScheduleID, currentAttempt, dispatchErr)
+		return ws.unclaimScheduledWorkflow(ctx, scheduled.ScheduleID, scheduled.LeaseExpiresUsec, nextRunUsec, currentAttempt)
+	}
+
+	// Exhausted all retries for this window - alert and advance to next cron time.
+	msg := fmt.Sprintf("Scheduled workflow %s failed all attempts. Skipping until next scheduled time", scheduled.ScheduleID)
+	log.CtxErrorf(ctx, "%s: %s", msg, dispatchErr)
+	alert.CtxUnexpectedEvent(ctx, "scheduled workflow dispatch failure", msg)
+
+	newConsecutiveFailures := scheduled.ConsecutiveScheduleFailureCount + 1
+	if newConsecutiveFailures >= ScheduledWorkflowMaxConsecutiveFailures {
+		msg := fmt.Sprintf("Scheduled workflow %s has failed %d consecutive scheduled windows. Pausing until manually re-enabled.", scheduled.ScheduleID, newConsecutiveFailures)
+		log.CtxError(ctx, msg)
+		alert.CtxUnexpectedEvent(ctx, "scheduled workflow paused due to consecutive failures", msg)
+	}
+
+	nextRunUsec, err := ws.calculateNextRunTimeUsec(scheduled.CronExpr)
+	if err != nil {
+		return err
+	}
+	// Reset the failed attempt count to 0 so that the next time the cron expression fires,
+	// the workflow is retried.
+	return ws.advanceWorkflowSchedule(ctx, scheduled.ScheduleID, scheduled.LeaseExpiresUsec, nextRunUsec, 0 /*failedAttemptCount*/, newConsecutiveFailures)
+}
+
+// unclaimScheduledWorkflow unclaims the scheduled workflow lease after a dispatch failure, so that another server can retry it.
+//
+// We filter on expected lease expire time to avoid race conditions if the lease has been acquired by another server.
+func (ws *workflowService) unclaimScheduledWorkflow(ctx context.Context, scheduleID string, expectedLeaseExpiresUsec int64, nextRunUsec int64, currentAttempt int64) error {
+	newAttempt := currentAttempt + 1
+	result := ws.env.GetDBHandle().NewQuery(ctx, "workflow_service_set_scheduled_workflow_retry").Raw(`
 		UPDATE "ScheduledRuns"
-		SET lease_expires_usec = 0
+		SET next_run_usec = ?,
+		    lease_expires_usec = 0,
+		    failed_attempt_count = ?
 		WHERE schedule_id = ?
-		AND next_run_usec <= ?
-	`, scheduleID, now).Exec()
+		  AND lease_expires_usec = ?
+	`, nextRunUsec, newAttempt, scheduleID, expectedLeaseExpiresUsec).Exec()
 	if result.Error != nil {
 		return result.Error
 	}
 	if result.RowsAffected == 0 {
-		return status.InternalErrorf("failed to unclaim scheduled workflow %s", scheduleID)
+		return fmt.Errorf("failed to unclaim scheduled workflow %s", scheduleID)
 	}
 	return nil
 }
@@ -2021,7 +2063,7 @@ func (ws *workflowService) dispatchScheduledWorkflow(ctx context.Context, schedu
 		alert.CtxUnexpectedEvent(ctx, "Failed to calculate next run time for scheduled workflow %s: %s", scheduled.ScheduleID, err)
 		return err
 	}
-	if err := ws.advanceWorkflowSchedule(ctx, scheduled.ScheduleID, nextRunUsec); err != nil {
+	if err := ws.advanceWorkflowSchedule(ctx, scheduled.ScheduleID, scheduled.LeaseExpiresUsec, nextRunUsec, 0 /*failedAttemptCount*/, 0 /*consecutiveScheduleFailureCount*/); err != nil {
 		alert.CtxUnexpectedEvent(ctx, "Failed to advance scheduled workflow %s to %d: %s", scheduled.ScheduleID, nextRunUsec, err)
 		return err
 	}
@@ -2051,11 +2093,24 @@ func (ws *workflowService) calculateNextRunTimeUsec(cronExpr string) (int64, err
 	return sched.Next(now).UnixMicro(), nil
 }
 
-func (ws *workflowService) advanceWorkflowSchedule(ctx context.Context, scheduleID string, nextRunUsec int64) error {
-	return ws.env.GetDBHandle().NewQuery(ctx, "workflow_service_advance_schedule").Raw(`
+// advanceWorkflowSchedule advances the scheduled workflow to the next run time, resetting the failed attempt count and consecutive schedule failure count.
+//
+// We filter on expected lease expire time to avoid race conditions if the lease has been acquired by another server.
+func (ws *workflowService) advanceWorkflowSchedule(ctx context.Context, scheduleID string, expectedLeaseExpiresUsec int64, nextRunUsec int64, failedAttemptCount int64, consecutiveScheduleFailureCount int64) error {
+	result := ws.env.GetDBHandle().NewQuery(ctx, "workflow_service_advance_schedule").Raw(`
 		UPDATE "ScheduledRuns"
 		SET next_run_usec = ?,
-		    lease_expires_usec = 0
+		    lease_expires_usec = 0,
+		    failed_attempt_count = ?,
+		    consecutive_schedule_failure_count = ?
 		WHERE schedule_id = ?
-	`, nextRunUsec, scheduleID).Exec().Error
+		  AND lease_expires_usec = ?
+	`, nextRunUsec, failedAttemptCount, consecutiveScheduleFailureCount, scheduleID, expectedLeaseExpiresUsec).Exec()
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return fmt.Errorf("failed to advance scheduled workflow %s", scheduleID)
+	}
+	return nil
 }
