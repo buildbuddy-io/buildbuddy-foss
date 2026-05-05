@@ -90,6 +90,7 @@ go_library(
         "//server/util/clickhouse",
         "//server/util/grpc_server",
         "//server/util/healthcheck",
+        "//server/util/kuberesolver",
         "//server/util/log",
         "//server/util/tracing",
         "//server/version",

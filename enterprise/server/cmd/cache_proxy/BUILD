@@ -51,6 +51,7 @@ go_library(
         "//server/util/grpc_client",
         "//server/util/grpc_server",
         "//server/util/healthcheck",
+        "//server/util/kuberesolver",
         "//server/util/log",
         "//server/util/monitoring",
         "//server/util/scratchspace",
@@ -62,6 +63,7 @@ go_library(
         "@org_golang_google_grpc//:grpc",
         "@org_golang_google_grpc//channelz/service",
         "@org_golang_google_grpc//stats",
+        "@org_golang_google_grpc//xds",
     ],
 )
 

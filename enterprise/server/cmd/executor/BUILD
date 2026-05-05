@@ -68,6 +68,7 @@ go_library(
         "@org_golang_google_genproto_googleapis_bytestream//:bytestream",
         "@org_golang_google_grpc//:grpc",
         "@org_golang_google_grpc//encoding/gzip",
+        "@org_golang_google_grpc//xds",
         "@org_golang_google_protobuf//types/known/timestamppb",
     ] + select({
         "@io_bazel_rules_go//go/platform:linux": [
