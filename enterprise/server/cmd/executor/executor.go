@@ -51,6 +51,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/util/statusz"
 	"github.com/buildbuddy-io/buildbuddy/server/util/tracing"
 	"github.com/buildbuddy-io/buildbuddy/server/util/usageutil"
+	"github.com/buildbuddy-io/buildbuddy/server/util/xds"
 	"github.com/buildbuddy-io/buildbuddy/server/version"
 	"github.com/buildbuddy-io/buildbuddy/server/xcode"
 	"github.com/google/uuid"
@@ -329,6 +330,10 @@ func main() {
 	if err := log.Configure(); err != nil {
 		fmt.Printf("Error configuring logging: %s", err)
 		os.Exit(1)
+	}
+
+	if err := xds.Bootstrap(rootContext, nil /*=client*/); err != nil {
+		log.Fatalf("Error bootstrapping xDS config: %s", err)
 	}
 
 	// Note: cleanupFUSEMounts needs to happen before deleteBuildRootOnStartup.
