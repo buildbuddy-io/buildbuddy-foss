@@ -1155,6 +1155,8 @@ type SchedulerServer struct {
 	forceUserOwnedDarwinExecutors bool
 	// Force windows executions to use executors owned by user.
 	forceUserOwnedWindowsExecutors bool
+	// Reject anonymous requests for ARM Linux remote build execution.
+	disableAnonymousArmLinuxExecution bool
 	// If enabled, executors will be required to present an API key with appropriate capabilities in order to register.
 	requireExecutorAuthorization bool
 
@@ -1239,6 +1241,7 @@ func NewSchedulerServerWithOptions(env environment.Env, options *Options) (*Sche
 		enableUserOwnedExecutors:          remote_execution_config.RemoteExecutionEnabled() && scheduler_server_config.UserOwnedExecutorsEnabled(),
 		forceUserOwnedDarwinExecutors:     remote_execution_config.RemoteExecutionEnabled() && scheduler_server_config.ForceUserOwnedDarwinExecutors(),
 		forceUserOwnedWindowsExecutors:    remote_execution_config.RemoteExecutionEnabled() && scheduler_server_config.ForceUserOwnedWindowsExecutors(),
+		disableAnonymousArmLinuxExecution: remote_execution_config.RemoteExecutionEnabled() && scheduler_server_config.DisableAnonymousArmLinuxExecution(),
 		requireExecutorAuthorization:      options.RequireExecutorAuthorization || (remote_execution_config.RemoteExecutionEnabled() && *requireExecutorAuthorization),
 		enableRedisAvailabilityMonitoring: remote_execution_config.RemoteExecutionEnabled() && env.GetRemoteExecutionService().RedisAvailabilityMonitoringEnabled(),
 		ownHostPort:                       fmt.Sprintf("%s:%d", ownHostname, ownPort),
@@ -1306,7 +1309,7 @@ func (s *SchedulerServer) getPoolOverrideFromExperiments(ctx context.Context, os
 }
 
 func (s *SchedulerServer) GetPoolInfo(ctx context.Context, os, arch, requestedPool, originalPool, workflowID string, poolType platform.PoolType) (*interfaces.PoolInfo, error) {
-	poolInfo, err := s.getPoolInfo(ctx, os, requestedPool, workflowID, poolType)
+	poolInfo, err := s.getPoolInfo(ctx, os, arch, requestedPool, workflowID, poolType)
 	if err != nil {
 		return nil, err
 	}
@@ -1320,7 +1323,7 @@ func (s *SchedulerServer) GetPoolInfo(ctx context.Context, os, arch, requestedPo
 	return poolInfo, nil
 }
 
-func (s *SchedulerServer) getPoolInfo(ctx context.Context, os, requestedPool, workflowID string, poolType platform.PoolType) (*interfaces.PoolInfo, error) {
+func (s *SchedulerServer) getPoolInfo(ctx context.Context, os, arch, requestedPool, workflowID string, poolType platform.PoolType) (*interfaces.PoolInfo, error) {
 	// Note: The defaultPoolName flag only applies to the shared executor pool.
 	// The pool name for self-hosted pools is always determined directly from
 	// platform props.
@@ -1352,6 +1355,9 @@ func (s *SchedulerServer) getPoolInfo(ctx context.Context, os, requestedPool, wo
 			}
 			if s.forceUserOwnedWindowsExecutors && os == windowsOperatingSystemName {
 				return nil, status.FailedPreconditionErrorf("Windows remote build execution is not enabled for anonymous requests.")
+			}
+			if s.disableAnonymousArmLinuxExecution && os == platform.LinuxOperatingSystemName && arch == platform.ARM64ArchitectureName {
+				return nil, status.FailedPreconditionErrorf("ARM Linux remote build execution is not enabled for anonymous requests.")
 			}
 			if poolType == platform.PoolTypeSelfHosted {
 				return nil, status.FailedPreconditionErrorf("Self-hosted executors not enabled for anonymous requests.")
