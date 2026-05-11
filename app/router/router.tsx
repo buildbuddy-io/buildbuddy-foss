@@ -433,6 +433,14 @@ class Router {
     return capabilities.usage && Boolean(user?.canCall("getUsage"));
   }
 
+  canAccessUsageAlertingPage(user?: User) {
+    return (
+      this.canAccessUsagePage(user) &&
+      capabilities.config.usageAlertsEnabled &&
+      Boolean(user?.canCall("getUsageAlertingRules"))
+    );
+  }
+
   canAccessWorkflowsPage() {
     return capabilities.config.workflowsEnabled;
   }
@@ -546,8 +554,11 @@ class Router {
     if (path === Path.workflowsPath && !this.canAccessWorkflowsPage()) {
       return new URL(Path.home, window.location.href);
     }
-    if (path === Path.usagePath && !this.canAccessUsagePage(user)) {
+    if (path.startsWith(Path.usagePath) && !this.canAccessUsagePage(user)) {
       return new URL(Path.home, window.location.href);
+    }
+    if (path.startsWith(Path.usageAlertingPath) && !this.canAccessUsageAlertingPage(user)) {
+      return new URL(Path.usagePath, window.location.href);
     }
 
     if (path === Path.settingsOrgDetailsPath && !this.canAccessOrgDetailsPage(user)) {
@@ -626,6 +637,7 @@ export class Path {
   static orgAccessDeniedPath = "/org/access-denied";
   static trendsPath = "/trends/";
   static usagePath = "/usage/";
+  static usageAlertingPath = "/usage/alerting";
   static auditLogsPath = "/audit-logs/";
   static executorsPath = "/executors/";
   static tapPath = "/tests/";
