@@ -1,3 +1,19 @@
+// Package sidecar manages the bb CLI's sidecar process: a long-lived background
+// helper that bazel talks to in place of the configured BES and remote cache
+// backends. The sidecar is started lazily, reused across CLI invocations with
+// matching configuration, and self-terminates after a period of inactivity.
+//
+// ConfigureSidecar rewrites a bazel argv to point --bes_backend and/or
+// --remote_cache at the sidecar's local unix socket, starting the sidecar if
+// one is not already running. If the sidecar cannot be started or reached, the
+// original argv is returned and the build proceeds directly against the
+// configured backends.
+//
+// Related packages:
+//   - cli/cmd/sidecar — the sidecar binary's main entrypoint; runs the
+//     long-lived process that this package starts and reuses.
+//   - cli/sidecar_proxy — the gRPC services (ByteStream/CAS/AC/Capabilities)
+//     that the sidecar process exposes to bazel.
 package sidecar
 
 import (
