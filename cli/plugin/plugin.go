@@ -40,6 +40,9 @@ const (
 	// invoked by BB as a plugin.
 	isPluginEnvVar = "IS_BB_PLUGIN"
 
+	execArgsFileEnvVar          = "EXEC_ARGS_FILE"
+	resolvedBazelArgsFileEnvVar = "RESOLVED_BAZEL_ARGS_FILE"
+
 	installCommandUsage = `
 Usage: bb install [REPO[@VERSION]][:PATH] [--user]
 
@@ -629,8 +632,9 @@ func (p *Plugin) commandEnv() []string {
 // last plugin.
 //
 // See cli/example_plugins/ping-remote/pre_bazel.sh for an example.
-func (p *Plugin) PreBazel(args, execArgs []string) ([]string, []string, error) {
-	// Write args to a file so the plugin can manipulate them.
+func (p *Plugin) PreBazel(bazelArgs *arg.BazelArgs, execArgs []string) (*arg.BazelArgs, []string, error) {
+	// Write bazel args to a file that the plugin can manipulate.
+	// Any changes are passed through to bazelisk.
 	argsFile, err := os.CreateTemp("", "bazelisk-args-*")
 	if err != nil {
 		return nil, nil, status.InternalErrorf("failed to create args file for pre-bazel hook: %s", err)
@@ -639,7 +643,23 @@ func (p *Plugin) PreBazel(args, execArgs []string) ([]string, []string, error) {
 		argsFile.Close()
 		os.Remove(argsFile.Name())
 	}()
-	if err := writeArgsFile(argsFile.Name(), args); err != nil {
+	// TODO(#7216): Write the forwarded args to the file.
+	if err := writeArgsFile(argsFile.Name(), bazelArgs.Resolved); err != nil {
+		return nil, nil, err
+	}
+
+	// Write resolved bazel args to a separate read-only file. The plugin may
+	// read this to see rc/config-expanded values, but only the forwarded args
+	// file is read back after the plugin runs. Any edits to this file are ignored.
+	resolvedArgsFile, err := os.CreateTemp("", "bazelisk-resolved-args-*")
+	if err != nil {
+		return nil, nil, status.InternalErrorf("failed to create resolved args file for pre-bazel hook: %s", err)
+	}
+	defer func() {
+		resolvedArgsFile.Close()
+		os.Remove(resolvedArgsFile.Name())
+	}()
+	if err := writeArgsFile(resolvedArgsFile.Name(), bazelArgs.Resolved); err != nil {
 		return nil, nil, err
 	}
 
@@ -667,7 +687,7 @@ func (p *Plugin) PreBazel(args, execArgs []string) ([]string, []string, error) {
 	}
 	if !exists {
 		log.Debugf("Bazel hook not found at %s", scriptPath)
-		return args, execArgs, nil
+		return bazelArgs, execArgs, nil
 	}
 	log.Debugf("Running pre-bazel hook for %s/%s", p.config.Repo, p.config.Path)
 	// TODO: support "pre_bazel.<any-extension>" as long as the file is
@@ -678,7 +698,8 @@ func (p *Plugin) PreBazel(args, execArgs []string) ([]string, []string, error) {
 	cmd.Stderr = os.Stderr
 	cmd.Stdout = os.Stdout
 	cmd.Env = p.commandEnv()
-	cmd.Env = append(cmd.Env, "EXEC_ARGS_FILE="+execArgsFile.Name())
+	cmd.Env = append(cmd.Env, execArgsFileEnvVar+"="+execArgsFile.Name())
+	cmd.Env = append(cmd.Env, resolvedBazelArgsFileEnvVar+"="+resolvedArgsFile.Name())
 	if err := cmd.Run(); err != nil {
 		return nil, nil, status.InternalErrorf("Pre-bazel hook for %s/%s failed: %s", p.config.Repo, p.config.Path, err)
 	}
@@ -702,7 +723,11 @@ func (p *Plugin) PreBazel(args, execArgs []string) ([]string, []string, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	return canonicalizedArgs, newExecArgs, nil
+	// TODO(#7216): Resolve bazel args after each plugin is run (using bazelArgs.Set), so every following plugin gets
+	// a refreshed resolved view of the bazel args (i.e. all --config flags expanded).
+	bazelArgs.Resolved = canonicalizedArgs
+
+	return bazelArgs, newExecArgs, nil
 }
 
 // PostBazel executes the plugin's post-bazel hook if it exists, allowing it to
