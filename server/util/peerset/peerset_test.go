@@ -183,3 +183,62 @@ func TestGetBackfillTargets(t *testing.T) {
 		assert.Equal(t, test.expectedBackfillHosts, backfillHosts)
 	}
 }
+
+func TestGetBackfillTargetsWithBlockBackfills(t *testing.T) {
+	// PreferredPeers contains a mix of peers that should be readable
+	// (a, b, c, d) but b and d are blocked from backfill (e.g. non-canonical
+	// same-zone peers that may hold a read-through cached copy).
+	for _, tc := range []struct {
+		name           string
+		preferred      []string
+		fallback       []string
+		blockBackfills []string
+		consume        int // number of peers to consume via GetNextPeer before computing backfill
+		wantSource     string
+		wantTargets    []string
+	}{
+		{
+			name:           "hit on canonical primary skips blocked targets",
+			preferred:      []string{"a", "b", "c", "d"},
+			blockBackfills: []string{"b", "d"},
+			consume:        3, // hit on "c"
+			wantSource:     "c",
+			wantTargets:    []string{"a"},
+		},
+		{
+			name:           "hit on blocked peer still skips blocked earlier peers",
+			preferred:      []string{"a", "b", "c", "d"},
+			blockBackfills: []string{"b", "d"},
+			consume:        2, // hit on "b" (blocked)
+			wantSource:     "b",
+			wantTargets:    []string{"a"},
+		},
+		{
+			name:           "nil block list = current behavior (no filter)",
+			preferred:      []string{"a", "b", "c", "d"},
+			blockBackfills: nil,
+			consume:        3,
+			wantSource:     "c",
+			wantTargets:    []string{"a", "b"},
+		},
+		{
+			name:           "block list covering all preferred peers leaves no targets",
+			preferred:      []string{"a", "b", "c", "d"},
+			blockBackfills: []string{"a", "b"},
+			consume:        3,
+			wantSource:     "c",
+			wantTargets:    []string{},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := peerset.New(tc.preferred, tc.fallback)
+			p.BlockBackfills = tc.blockBackfills
+			for i := 0; i < tc.consume; i++ {
+				p.GetNextPeer()
+			}
+			source, targets := p.GetBackfillTargets()
+			assert.Equal(t, tc.wantSource, source)
+			assert.Equal(t, tc.wantTargets, targets)
+		})
+	}
+}

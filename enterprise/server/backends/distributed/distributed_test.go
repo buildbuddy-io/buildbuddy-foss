@@ -2363,6 +2363,217 @@ func TestReadThroughLocalCache(t *testing.T) {
 
 }
 
+func TestReadThroughPeers(t *testing.T) {
+	// Zone map: A = zone-a, B = zone-b, "" = unknown.
+	zones := map[string]string{
+		"a1": "A", "a2": "A", "a3": "A",
+		"b1": "B", "b2": "B", "b3": "B",
+	}
+	zoneOf := func(p string) string {
+		return zones[p]
+	}
+
+	for _, tc := range []struct {
+		name               string
+		primary            []string
+		secondary          []string
+		self               string
+		myZone             string
+		wantPrimary        []string
+		wantSecondary      []string
+		wantBlockBackfills []string
+	}{
+		{
+			// A same-zone primary already exists, so we leave both lists
+			// alone. The unsorted primary is returned as-is; readPeers
+			// applies the locality sort afterward.
+			name:               "same-zone primary exists, no promotion",
+			primary:            []string{"a1", "a2", "b1"},
+			secondary:          []string{"a3", "b2", "b3"},
+			self:               "a1",
+			myZone:             "A",
+			wantPrimary:        []string{"a1", "a2", "b1"},
+			wantSecondary:      []string{"a3", "b2", "b3"},
+			wantBlockBackfills: nil,
+		},
+		{
+			// Self is a same-zone secondary, but another same-zone peer is
+			// already in primary, so no promotion happens. Self stays in
+			// secondary.
+			name:               "same-zone primary exists, self in secondary",
+			primary:            []string{"a1", "b1", "b2"},
+			secondary:          []string{"a2", "a3", "b3"},
+			self:               "a2",
+			myZone:             "A",
+			wantPrimary:        []string{"a1", "b1", "b2"},
+			wantSecondary:      []string{"a2", "a3", "b3"},
+			wantBlockBackfills: nil,
+		},
+		{
+			// Self is already a primary peer. No promotion needed; the
+			// short-circuit catches `peer == self` even though self's
+			// zone may be unknown.
+			name:               "self is a primary",
+			primary:            []string{"a1", "b1", "b2"},
+			secondary:          []string{"a2", "a3", "b3"},
+			self:               "a1",
+			myZone:             "A",
+			wantPrimary:        []string{"a1", "b1", "b2"},
+			wantSecondary:      []string{"a2", "a3", "b3"},
+			wantBlockBackfills: nil,
+		},
+		{
+			// No same-zone primary, no self in primary. All same-zone
+			// secondaries get appended to primary and reported as
+			// promoted (so callers can block them from backfill).
+			name:               "no same-zone primary, all secondaries are sz",
+			primary:            []string{"b1", "b2", "b3"},
+			secondary:          []string{"a1", "a2", "a3"},
+			self:               "stranger",
+			myZone:             "A",
+			wantPrimary:        []string{"b1", "b2", "b3", "a1", "a2", "a3"},
+			wantSecondary:      []string{},
+			wantBlockBackfills: []string{"a1", "a2", "a3"},
+		},
+		{
+			// Only the same-zone secondaries are promoted; other-zone and
+			// unknown-zone secondaries stay behind in the new secondary.
+			name:               "no same-zone primary, mixed secondary",
+			primary:            []string{"b1", "b2", "b3"},
+			secondary:          []string{"a1", "c1", "a2"},
+			self:               "stranger",
+			myZone:             "A",
+			wantPrimary:        []string{"b1", "b2", "b3", "a1", "a2"},
+			wantSecondary:      []string{"c1"},
+			wantBlockBackfills: []string{"a1", "a2"},
+		},
+		{
+			// No same-zone primary and no same-zone secondary either.
+			// Nothing to promote, but we still return a fresh secondary
+			// slice since the function entered the promotion path.
+			name:               "no same-zone peers anywhere",
+			primary:            []string{"b1", "b2", "b3"},
+			secondary:          []string{"c1", "c2"},
+			self:               "stranger",
+			myZone:             "A",
+			wantPrimary:        []string{"b1", "b2", "b3"},
+			wantSecondary:      []string{"c1", "c2"},
+			wantBlockBackfills: nil,
+		},
+		{
+			// All peer zones are unknown (zoneOf returns ""). The
+			// short-circuit fires because `peer == self` matches x1.
+			name:               "all peers unknown zone, self in primary",
+			primary:            []string{"x1", "x2", "x3"},
+			secondary:          []string{"x4", "x5", "x6"},
+			self:               "x1",
+			myZone:             "A",
+			wantPrimary:        []string{"x1", "x2", "x3"},
+			wantSecondary:      []string{"x4", "x5", "x6"},
+			wantBlockBackfills: nil,
+		},
+		{
+			// myZone is unknown — short-circuit on the first condition.
+			name:               "myZone unknown, no-op",
+			primary:            []string{"a1", "a2", "b1"},
+			secondary:          []string{"a3", "b2", "b3"},
+			self:               "stranger",
+			myZone:             "",
+			wantPrimary:        []string{"a1", "a2", "b1"},
+			wantSecondary:      []string{"a3", "b2", "b3"},
+			wantBlockBackfills: nil,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			primary, secondary, blockBackfills := readThroughPeers(tc.primary, tc.secondary, tc.self, tc.myZone, zoneOf)
+			assert.Equal(t, tc.wantPrimary, primary, "primary")
+			assert.Equal(t, tc.wantSecondary, secondary, "secondary")
+			assert.Equal(t, tc.wantBlockBackfills, blockBackfills, "blockBackfills")
+		})
+	}
+}
+
+func TestEnsureSameZonePrimary(t *testing.T) {
+	zones := map[string]string{
+		"a1": "A", "a2": "A", "a3": "A",
+		"b1": "B", "b2": "B", "b3": "B",
+	}
+	zoneOf := func(p string) string {
+		return zones[p]
+	}
+
+	for _, tc := range []struct {
+		name          string
+		peers         []string
+		primaryCount  int
+		self          string
+		myZone        string
+		wantPrimary   []string
+		wantSecondary []string
+	}{
+		{
+			name:          "primary already covers self zone",
+			peers:         []string{"a1", "b1", "b2", "a2", "a3", "b3"},
+			primaryCount:  3,
+			self:          "a3",
+			myZone:        "A",
+			wantPrimary:   []string{"a1", "b1", "b2"},
+			wantSecondary: []string{"a2", "a3", "b3"},
+		},
+		{
+			name:          "no same-zone primary, self not in any set",
+			peers:         []string{"b1", "b2", "b3", "a1", "a2", "a3"},
+			primaryCount:  3,
+			self:          "outsider",
+			myZone:        "A",
+			wantPrimary:   []string{"b1", "b2", "b3", "outsider"},
+			wantSecondary: []string{"a1", "a2", "a3"},
+		},
+		{
+			name:          "no same-zone primary, self in secondary (removed)",
+			peers:         []string{"b1", "b2", "b3", "a1", "a2", "a3"},
+			primaryCount:  3,
+			self:          "a2",
+			myZone:        "A",
+			wantPrimary:   []string{"b1", "b2", "b3", "a2"},
+			wantSecondary: []string{"a1", "a3"},
+		},
+		{
+			name:          "self already a primary (no-op)",
+			peers:         []string{"a1", "b1", "b2", "a2", "b3"},
+			primaryCount:  3,
+			self:          "a1",
+			myZone:        "A",
+			wantPrimary:   []string{"a1", "b1", "b2"},
+			wantSecondary: []string{"a2", "b3"},
+		},
+		{
+			name:          "self zone unknown (no-op)",
+			peers:         []string{"b1", "b2", "b3", "a1", "a2"},
+			primaryCount:  3,
+			self:          "outsider",
+			myZone:        "",
+			wantPrimary:   []string{"b1", "b2", "b3"},
+			wantSecondary: []string{"a1", "a2"},
+		},
+		{
+			name:          "all peer zones unknown, self in named zone",
+			peers:         []string{"x1", "x2", "x3", "x4", "x5"},
+			primaryCount:  3,
+			self:          "self",
+			myZone:        "A",
+			wantPrimary:   []string{"x1", "x2", "x3", "self"},
+			wantSecondary: []string{"x4", "x5"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ps := ensureSameZonePrimary(tc.peers, tc.primaryCount, tc.self, tc.myZone, zoneOf)
+			assert.Equal(t, tc.wantPrimary, ps.PreferredPeers, "primary")
+			assert.Equal(t, tc.wantSecondary, ps.FallbackPeers, "secondary")
+		})
+	}
+}
+
 func TestNoEncryptedContentsInLookaside(t *testing.T) {
 	// Configure the authenticator and environment with a single user with
 	// encryption enabled: "user"
