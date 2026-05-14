@@ -121,6 +121,9 @@ const (
 	// workflow invocation results after the user-specified timeout is reached.
 	timeoutGracePeriod = 10 * time.Minute
 
+	// How often to scan for due scheduled workflows.
+	scheduleScanInterval = 15 * time.Minute
+
 	// Only one server should try to schedule a given workflow at a time. It has this much
 	// time to dispatch the workflow before another server can acquire the lease and schedule the run.
 	// Given that dispatching a workflow is expected to be quick, this should be more than enough time,
@@ -205,6 +208,7 @@ func NewWorkflowService(env environment.Env) *workflowService {
 		bbUrl: build_buddy_url.WithPath(""),
 	}
 	ws.startBackgroundWorkers()
+	ws.startScheduleScanner()
 	return ws
 }
 
@@ -1907,7 +1911,46 @@ func withEnvOverrides(ctx context.Context, env []*repb.Command_EnvironmentVariab
 		ctx, platform.EnvOverridesPropertyName, strings.Join(assignments, ","))
 }
 
+func (ws *workflowService) startScheduleScanner() {
+	if efp := ws.env.GetExperimentFlagProvider(); efp == nil || !efp.Boolean(ws.env.GetServerContext(), "remote_execution.enable_scheduled_workflows", false) {
+		return
+	}
+
+	ctx, cancel := context.WithCancel(ws.env.GetServerContext())
+	ticker := time.NewTicker(scheduleScanInterval)
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-ticker.C:
+				if err := ws.RunScheduledWorkflows(ctx); err != nil {
+					log.CtxErrorf(ctx, "Failed to run scheduled workflows: %s", err)
+				}
+			case <-ctx.Done():
+				ticker.Stop()
+				return
+			}
+		}
+	}()
+
+	ws.env.GetHealthChecker().RegisterShutdownFunction(func(shutdownCtx context.Context) error {
+		cancel()
+		select {
+		case <-done:
+		case <-shutdownCtx.Done():
+			return shutdownCtx.Err()
+		}
+		return nil
+	})
+}
+
 func (ws *workflowService) RunScheduledWorkflows(ctx context.Context) error {
+	if efp := ws.env.GetExperimentFlagProvider(); efp == nil || !efp.Boolean(ctx, "remote_execution.enable_scheduled_workflows", false) {
+		return nil
+	}
+
 	if ws.env.GetDBHandle() == nil || ws.env.GetGitHubAppService() == nil {
 		return status.InternalError("database or GitHub app service not available")
 	}
@@ -1936,7 +1979,7 @@ func (ws *workflowService) claimScheduledWorkflow(ctx context.Context) (*tables.
 	dbh := ws.env.GetDBHandle()
 	scheduled := &tables.ScheduledRun{}
 	err := dbh.Transaction(ctx, func(tx interfaces.DB) error {
-		now := ws.env.GetClock().Now()
+		now := ws.env.GetClock().Now().UTC()
 		nowUsec := now.UnixMicro()
 		err := tx.NewQuery(ctx, "workflow_service_lock_scheduled_run").Raw(`
 			SELECT *
@@ -1984,7 +2027,7 @@ func (ws *workflowService) handleScheduledWorkflowFailure(ctx context.Context, s
 	if currentAttempt+1 < ScheduledWorkflowMaxRetries {
 		// Multiply the backoff by 2 for each retry, starting at 30 seconds.
 		backoff := 30 * time.Second << uint(currentAttempt)
-		nextRunUsec := ws.env.GetClock().Now().Add(backoff).UnixMicro()
+		nextRunUsec := ws.env.GetClock().Now().UTC().Add(backoff).UnixMicro()
 		log.CtxWarningf(ctx, "Scheduled workflow %s failed attempt %v: %s", scheduled.ScheduleID, currentAttempt, dispatchErr)
 		return ws.unclaimScheduledWorkflow(ctx, scheduled.ScheduleID, scheduled.LeaseExpiresUsec, nextRunUsec, currentAttempt)
 	}
@@ -2125,7 +2168,7 @@ func (ws *workflowService) calculateNextRunTimeUsec(cronExpr string) (int64, err
 	if err != nil {
 		return 0, err
 	}
-	now := ws.env.GetClock().Now()
+	now := ws.env.GetClock().Now().UTC()
 	return sched.Next(now).UnixMicro(), nil
 }
 
