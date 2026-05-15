@@ -2,6 +2,7 @@ package usage_service_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -152,6 +153,7 @@ func TestUsageFields_CoverEveryUsageFieldAndAlertingMetric(t *testing.T) {
 	seenAlertingMetrics := map[usagepb.UsageAlertingMetric_Value]struct{}{}
 	for _, field := range usage_service.UsageFields {
 		require.NotEmpty(t, field.PrimaryDBExpression)
+		require.NotEmpty(t, field.OLAPExpression)
 		require.NotEmpty(t, field.Name)
 
 		usageFieldName := field.Name
@@ -161,6 +163,7 @@ func TestUsageFields_CoverEveryUsageFieldAndAlertingMetric(t *testing.T) {
 
 		assert.NotEqual(t, usagepb.UsageAlertingMetric_UNKNOWN, field.AlertingMetric)
 		assert.Contains(t, alertingMetrics, field.AlertingMetric)
+		assert.Equal(t, strings.ToUpper(field.Name), field.AlertingMetric.String())
 		assert.NotContains(t, seenAlertingMetrics, field.AlertingMetric)
 		seenAlertingMetrics[field.AlertingMetric] = struct{}{}
 	}
@@ -217,13 +220,12 @@ func TestUsageAlertingRules_CreateListDelete(t *testing.T) {
 	assert.Empty(t, cmp.Diff(expectedRule, createRsp.GetUsageAlertingRule(), protocmp.Transform()))
 
 	// Simulate evaluator-controlled status updates and verify listing returns them.
-	lastEvaluation := now.Add(10 * time.Minute)
 	lastFired := now.Add(20 * time.Minute)
 	err = env.GetDBHandle().NewQuery(ctx, "test_update_usage_alerting_rule_status").Raw(`
 		UPDATE "UsageAlertingRules"
-		SET last_evaluation_usec = ?, last_fired_usec = ?
+		SET last_fired_usec = ?
 		WHERE usage_alerting_rule_id = ?
-	`, lastEvaluation.UnixMicro(), lastFired.UnixMicro(), ruleID).Exec().Error
+	`, lastFired.UnixMicro(), ruleID).Exec().Error
 	require.NoError(t, err)
 
 	listRsp, err := service.GetUsageAlertingRules(ctx1, &usagepb.GetUsageAlertingRulesRequest{
@@ -231,8 +233,7 @@ func TestUsageAlertingRules_CreateListDelete(t *testing.T) {
 	})
 	require.NoError(t, err)
 	expectedRule.Status = &usagepb.UsageAlertingRuleStatus{
-		LastEvaluationTimestamp: timestamppb.New(lastEvaluation),
-		LastFiredTimestamp:      timestamppb.New(lastFired),
+		LastFiredTimestamp: timestamppb.New(lastFired),
 	}
 	assert.Empty(t, cmp.Diff(
 		&usagepb.GetUsageAlertingRulesResponse{UsageAlertingRule: []*usagepb.UsageAlertingRule{expectedRule}},
