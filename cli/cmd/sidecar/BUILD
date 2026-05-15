@@ -1,4 +1,4 @@
-load("@io_bazel_rules_go//go:def.bzl", "go_library")
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 
 package(default_visibility = ["//cli:__subpackages__"])
 
@@ -28,4 +28,10 @@ go_library(
         "@org_golang_google_grpc//:grpc",
         "@org_golang_google_grpc//reflection",
     ],
+)
+
+go_test(
+    name = "sidecar_test",
+    srcs = ["sidecar_test.go"],
+    embed = [":sidecar"],
 )
