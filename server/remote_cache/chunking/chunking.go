@@ -17,6 +17,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/metrics"
 	"github.com/buildbuddy-io/buildbuddy/server/remote_cache/digest"
 	"github.com/buildbuddy-io/buildbuddy/server/util/cdc"
+	"github.com/buildbuddy-io/buildbuddy/server/util/compression"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
 	"github.com/buildbuddy-io/buildbuddy/server/util/proto"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
@@ -463,13 +464,18 @@ func (cm *Manifest) verifyChunks(ctx context.Context, cache interfaces.Cache) er
 	// but low enough to avoid buffering too much data in memory. The
 	// distributed cache sends requests to shards in parallel.
 	const batchSize = 20
+	readCompressed := cache.SupportsCompressor(repb.Compressor_ZSTD)
+	var decompressedData []byte
+	if readCompressed {
+		decompressedData = make([]byte, 0, MaxChunkSizeBytes())
+	}
 	resources := make([]*rspb.ResourceName, 0, batchSize)
 	for chunkDigestsPart := range slices.Chunk(cm.ChunkDigests, batchSize) {
 		for _, chunkDigest := range chunkDigestsPart {
-			// TODO(vanja): Maybe read these compressed and decompress while
-			// hashing, to save network bandwidth, instead of decompressing on
-			// the server.
 			chunkRN := digest.NewCASResourceName(chunkDigest, cm.InstanceName, cm.DigestFunction)
+			if readCompressed {
+				chunkRN.SetCompressor(repb.Compressor_ZSTD)
+			}
 			if err := chunkRN.Validate(); err != nil {
 				return status.InvalidArgumentErrorf("invalid chunk resource name %v for blob %s: %s", chunkRN, cm.BlobDigest.GetHash(), err)
 			}
@@ -483,6 +489,13 @@ func (cm *Manifest) verifyChunks(ctx context.Context, cache interfaces.Cache) er
 			chunkData, ok := chunks[r.GetDigest()]
 			if !ok {
 				return status.InvalidArgumentErrorf("invalid manifest: chunk %v not found in the CAS for blob %v", r.GetDigest().GetHash(), cm.BlobDigest.GetHash())
+			}
+			if readCompressed {
+				decompressedData, err = compression.DecompressZstd(decompressedData, chunkData)
+				if err != nil {
+					return status.WrapErrorf(err, "decompress chunk %s for blob %s", r.GetDigest().GetHash(), cm.BlobDigest.GetHash())
+				}
+				chunkData = decompressedData
 			}
 			_, err := hasher.Write(chunkData)
 			if err != nil {
